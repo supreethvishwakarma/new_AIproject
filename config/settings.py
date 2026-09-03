@@ -93,7 +93,7 @@ MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "50"))
 INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "50000"))
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "5"))
-MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "0.05"))
+MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.05"))  # fraction of capital, e.g. 0.05 = 5%
 SCORE_THRESHOLD = float(os.getenv("SCORE_THRESHOLD", "0.6"))
 
 # ── Model Paths ───────────────────────────────────────────────────────────────
