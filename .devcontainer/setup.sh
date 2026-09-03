@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Runs once when the Codespace is created. Installs everything needed to
-# demo the dashboard: Python/Node deps, a local Postgres seeded with
-# synthetic NIFTY-I candles (so charts/regime/scanning have something to
-# read before a real TrueData/Angel One feed is connected), and system
-# time pinned to IST (the app's market-hours checks assume the host clock
-# is already IST — true on a dev's own machine, false on a UTC container).
+# run the dashboard against REAL data: Python/Node deps, an empty local
+# Postgres (schema only — no synthetic candles), and system time pinned to
+# IST (the app's market-hours checks assume the host clock is already IST —
+# true on a dev's own machine, false on a UTC container). Real candles only
+# ever come from TrueData (TRUEDATA_USER/TRUEDATA_PASSWORD in .env) — set
+# those and the backend's live collector fills this DB during market hours.
+# (Synthetic data is available via scripts/seed_demo_candles.py but is
+# intentionally NOT run here.)
 set -e
 cd "$(dirname "$0")/.."
 
@@ -26,7 +29,6 @@ sudo service postgresql start
 sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';" > /dev/null
 sudo -u postgres psql -c "CREATE DATABASE trading;" > /dev/null 2>&1 || true
 PGPASSWORD=postgres psql -h localhost -U postgres -d trading -f database/schema.sql > /dev/null 2>&1 || true
-.venv/bin/python scripts/seed_demo_candles.py --days 15
 
 cd dashboard
 npm install --no-audit --no-fund

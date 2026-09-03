@@ -560,10 +560,9 @@ def _detect_tick_gaps_today(min_gap_secs: int = TICK_STALENESS_THRESHOLD_SECS) -
     Used by _backfill_ticks_if_stale() so it fixes BOTH leading/internal
     gaps (09:15 → first observed tick) AND any subsequent dropouts.
     """
-    today = date.today()
+    today = now_ist().date()
     session_start = datetime(today.year, today.month, today.day, 9, 15, 0)
-    now_ist = datetime.now()
-    if now_ist < session_start:
+    if now_ist() < session_start:
         return []
 
     df = read_sql(
@@ -876,8 +875,8 @@ def scan_market():
         # would have rejected. MEDIUM profile: afternoon_cut=210 = 12:45 IST.
         from config.risk_profiles import get_risk_profile as _get_rp_t, RiskLevel as _RL_t
         _prof = _get_rp_t(_RL_t.MEDIUM)
-        now_ist = datetime.now()
-        minutes_from_open = max(0, now_ist.hour * 60 + now_ist.minute - 555)  # 9:15 IST = 555 min
+        _now_ist = now_ist()
+        minutes_from_open = max(0, _now_ist.hour * 60 + _now_ist.minute - 555)  # 9:15 IST = 555 min
         if minutes_from_open < _prof.skip_first_min:
             return
         if minutes_from_open > (375 - _prof.skip_last_min):
@@ -1400,7 +1399,7 @@ def background_scanner():
     """Background thread that scans every 30 seconds. Triggers EOD tasks after market close."""
     global scanner_enabled
     while True:
-        now = datetime.now()
+        now = now_ist()
 
         if scanner_enabled:
             try:
@@ -1975,7 +1974,7 @@ def _tick_monitor_loop():
     while True:
         try:
             # Only run during ~9:00-15:35 IST
-            now = datetime.now()
+            now = now_ist()
             if not (9 <= now.hour < 16):
                 time.sleep(30)
                 continue
@@ -2171,7 +2170,7 @@ def _ensure_collector():
     global _collector_process
     import subprocess
 
-    now = datetime.now()
+    now = now_ist()
     # Only auto-start during market hours (9:00 - 15:35 IST, weekdays)
     if now.weekday() >= 5 or not (9 <= now.hour < 16):
         return
