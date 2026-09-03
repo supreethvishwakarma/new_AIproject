@@ -42,6 +42,7 @@ from config.settings import (
     SCORE_THRESHOLD,
 )
 from utils.logger import get_logger
+from utils.helpers import now_ist
 
 logger = get_logger("dashboard")
 
@@ -522,8 +523,7 @@ def initialize():
 
 def _is_market_hours() -> bool:
     """Return True if current IST time is within market hours 9:15–15:30."""
-    now_ist = datetime.now()
-    t = now_ist.time()
+    t = now_ist().time()
     from datetime import time as dtime
     return dtime(9, 15) <= t <= dtime(15, 31)
 

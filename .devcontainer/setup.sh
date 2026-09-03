@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Runs once when the Codespace is created. Installs everything needed to
-# demo the paper-trading dashboard — no database required (the dashboard
-# degrades gracefully without one; paper positions live in-memory + a
-# JSON file, not Postgres).
+# demo the dashboard: Python/Node deps, a local Postgres seeded with
+# synthetic NIFTY-I candles (so charts/regime/scanning have something to
+# read before a real TrueData/Angel One feed is connected), and system
+# time pinned to IST (the app's market-hours checks assume the host clock
+# is already IST — true on a dev's own machine, false on a UTC container).
 set -e
 cd "$(dirname "$0")/.."
 
@@ -17,8 +19,14 @@ echo "from pandas_ta_classic import __version__" >> "$SITE/pandas_ta.py"
 
 [ -f .env ] || cp .env.example .env
 # Paper mode needs no broker credentials — TRADE_MODE defaults to "paper".
-# DB_* vars point at a Postgres that doesn't exist here; that's fine, the
-# app logs a warning and keeps running with db_connected=false.
+
+sudo apt-get update -qq
+sudo apt-get install -y -qq postgresql > /dev/null
+sudo service postgresql start
+sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';" > /dev/null
+sudo -u postgres psql -c "CREATE DATABASE trading;" > /dev/null 2>&1 || true
+PGPASSWORD=postgres psql -h localhost -U postgres -d trading -f database/schema.sql > /dev/null 2>&1 || true
+.venv/bin/python scripts/seed_demo_candles.py --days 15
 
 cd dashboard
 npm install --no-audit --no-fund

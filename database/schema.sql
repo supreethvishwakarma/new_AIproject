@@ -78,7 +78,8 @@ CREATE TABLE IF NOT EXISTS minute_candles (
     close       DOUBLE PRECISION NOT NULL,
     volume      BIGINT          NOT NULL DEFAULT 0,
     vwap        DOUBLE PRECISION,
-    oi          BIGINT          DEFAULT 0
+    oi          BIGINT          DEFAULT 0,
+    UNIQUE (symbol, timestamp)
 );
 
 SELECT create_hypertable('minute_candles', 'timestamp', if_not_exists => TRUE);

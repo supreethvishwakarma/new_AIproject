@@ -4,7 +4,7 @@ Utility Helpers
 Common utility functions used across the system.
 """
 
-from datetime import datetime, time as dt_time
+from datetime import datetime, timedelta, timezone, time as dt_time
 
 from config.settings import (
     MARKET_OPEN_HOUR,
@@ -13,10 +13,26 @@ from config.settings import (
     MARKET_CLOSE_MINUTE,
 )
 
+_IST_OFFSET = timedelta(hours=5, minutes=30)
+
+
+def now_ist() -> datetime:
+    """
+    Current IST time, as a naive datetime.
+
+    The rest of this codebase treats `datetime.now()` as if it were already
+    IST (per CLAUDE.md: "Python uses naive local IST for comparisons"), which
+    only holds on a machine whose system clock is set to IST. On a cloud
+    container (Codespaces, most PaaS hosts) the system clock is UTC, which
+    silently shifts every market-hours check by 5:30 — this converts
+    explicitly instead of trusting the host's local time.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None) + _IST_OFFSET
+
 
 def is_market_open(now: datetime = None) -> bool:
     """Check if NSE market is currently open (9:15 AM – 3:30 PM IST, Mon–Fri)."""
-    now = now or datetime.now()
+    now = now or now_ist()
 
     # Weekend check
     if now.weekday() >= 5:

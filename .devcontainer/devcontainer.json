@@ -4,6 +4,9 @@
   "features": {
     "ghcr.io/devcontainers/features/node:1": { "version": "20" }
   },
+  "containerEnv": {
+    "TZ": "Asia/Kolkata"
+  },
   "postCreateCommand": "bash .devcontainer/setup.sh",
   "postStartCommand": "bash .devcontainer/start.sh",
   "forwardPorts": [3000, 5050],

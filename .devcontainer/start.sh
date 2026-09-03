@@ -11,6 +11,8 @@ pkill -f "backend/app.py" 2>/dev/null || true
 pkill -f "next dev" 2>/dev/null || true
 sleep 1
 
+sudo service postgresql start 2>/dev/null || true
+
 nohup .venv/bin/python backend/app.py > /tmp/backend.log 2>&1 &
 
 if [ -n "$CODESPACE_NAME" ]; then
