@@ -279,3 +279,40 @@ export async function clearClosedPositions(mode: TradingMode = "test"): Promise<
 export async function setAutoTrade(enabled: boolean): Promise<{ auto_trade_enabled: boolean }> {
   return postJSON<{ auto_trade_enabled: boolean }>("/api/auto_trade", { enabled });
 }
+
+export interface BrokerStatus {
+  mode: string;
+  broker: string;
+  connected: boolean;
+  credentials_configured: boolean;
+  halted: boolean;
+  halt_reason: string;
+  daily_pnl: number;
+  trade_count: number;
+  max_daily_loss: number;
+  max_concurrent: number;
+  confirmation_mode: string;
+}
+
+export interface AngelOneCredentials {
+  api_key: string;
+  client_id: string;
+  password: string;
+  totp_secret?: string;
+}
+
+export async function getBrokerStatus(): Promise<BrokerStatus> {
+  return fetchJSON<BrokerStatus>("/api/broker/status");
+}
+
+export async function saveBrokerCredentials(creds: AngelOneCredentials): Promise<{ ok: boolean; message: string }> {
+  return postJSON<{ ok: boolean; message: string }>("/api/broker/credentials", creds);
+}
+
+export async function connectBroker(): Promise<{ connected: boolean; broker: string }> {
+  return postJSON<{ connected: boolean; broker: string }>("/api/broker/connect");
+}
+
+export async function loginBrokerTotp(totp?: string): Promise<{ authenticated: boolean }> {
+  return postJSON<{ authenticated: boolean }>("/api/broker/auth/login", totp ? { totp } : {});
+}

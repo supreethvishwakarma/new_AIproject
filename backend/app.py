@@ -3140,6 +3140,19 @@ def api_broker_connect():
     return jsonify({"connected": ok, "broker": order_manager.adapter.broker_name})
 
 
+@app.route("/api/broker/credentials", methods=["POST"])
+def api_broker_credentials():
+    """Save Angel One credentials (API key, client ID, password, TOTP secret)."""
+    body = request.get_json(force=True) if request.is_json else {}
+    result = order_manager.configure_broker_credentials(
+        api_key=body.get("api_key", "").strip(),
+        client_id=body.get("client_id", "").strip(),
+        password=body.get("password", ""),
+        totp_secret=body.get("totp_secret", "").strip(),
+    )
+    return jsonify(result)
+
+
 @app.route("/api/broker/auth/login_url")
 def api_broker_login_url():
     """Angel One uses direct TOTP login — no browser redirect step needed."""

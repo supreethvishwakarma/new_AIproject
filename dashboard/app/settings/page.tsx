@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from "react";
 import Sidebar from "@/components/Sidebar";
 import RiskProfileCard from "@/components/RiskProfileCard";
+import BrokerCredentialsForm from "@/components/BrokerCredentialsForm";
 import { fetchJSON, postJSON, type RiskProfile } from "@/lib/api";
 import { Play } from "lucide-react";
 
@@ -39,6 +40,9 @@ export default function SettingsPage() {
           <h1 className="text-sm font-bold uppercase tracking-wider" style={{ color: '#00e87b' }}>Settings</h1>
           <p className="text-[10px] mt-0.5" style={{ color: '#3d4450' }}>RISK PROFILES, EXECUTION, SYSTEM CONFIG</p>
         </div>
+
+        {/* Angel One broker connection */}
+        <BrokerCredentialsForm />
 
         {/* Risk profile selection */}
         <div className="t-panel p-5 mb-4">

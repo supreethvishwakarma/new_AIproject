@@ -87,6 +87,43 @@ class AngelOneAdapter(BrokerAdapter):
         self._connected = False
         self._symbol_token_cache: dict[str, str] = {}
 
+    # ── Configuration ────────────────────────────────────────────────
+
+    def configure(
+        self,
+        api_key: str = "",
+        client_id: str = "",
+        password: str = "",
+        totp_secret: str = "",
+    ) -> None:
+        """
+        Update credentials at runtime (e.g. submitted from the dashboard's
+        broker-connection form) without restarting the server.
+
+        Only non-empty fields overwrite the current value, so partial
+        updates (e.g. rotating just the password) are safe.
+        """
+        if api_key:
+            self._api_key = api_key
+            os.environ["ANGEL_ONE_API_KEY"] = api_key
+        if client_id:
+            self._client_id = client_id
+            os.environ["ANGEL_ONE_CLIENT_ID"] = client_id
+        if password:
+            self._password = password
+            os.environ["ANGEL_ONE_PASSWORD"] = password
+        if totp_secret:
+            self._totp_secret = totp_secret
+            os.environ["ANGEL_ONE_TOTP_SECRET"] = totp_secret
+
+        # Credentials changed — any existing session is no longer valid.
+        self._connected = False
+        logger.info(f"Angel One credentials updated (client_id={self._client_id or 'unset'})")
+
+    @property
+    def has_credentials(self) -> bool:
+        return bool(self._api_key and self._client_id and self._password)
+
     # ── Authentication ────────────────────────────────────────────────
 
     def authenticate(self, totp: Optional[str] = None) -> bool:

@@ -148,6 +148,32 @@ class OrderManager:
             logger.error(f"Failed to connect to {self._adapter.broker_name}")
         return ok
 
+    def configure_broker_credentials(
+        self,
+        api_key: str = "",
+        client_id: str = "",
+        password: str = "",
+        totp_secret: str = "",
+    ) -> dict:
+        """
+        Save Angel One credentials submitted from the dashboard's broker
+        connection form. No-op with a clear error if the active adapter
+        isn't Angel One (e.g. TRADE_MODE=paper).
+        """
+        from broker.angelone_adapter import AngelOneAdapter
+
+        if not isinstance(self._adapter, AngelOneAdapter):
+            return {
+                "ok": False,
+                "message": f"Active adapter is {self._adapter.broker_name}, not Angel One "
+                           f"(set TRADE_MODE=angelone and restart to switch).",
+            }
+
+        self._adapter.configure(
+            api_key=api_key, client_id=client_id, password=password, totp_secret=totp_secret,
+        )
+        return {"ok": True, "message": "Credentials saved"}
+
     def reset_daily(self):
         """Call at start of each trading day to reset counters."""
         self._daily_pnl = 0.0
@@ -455,6 +481,7 @@ class OrderManager:
             "mode": self._mode,
             "broker": self._adapter.broker_name,
             "connected": self._adapter.is_connected,
+            "credentials_configured": getattr(self._adapter, "has_credentials", True),
             "halted": self._halted,
             "halt_reason": self._halt_reason,
             "daily_pnl": round(self._daily_pnl, 2),
