@@ -2010,6 +2010,45 @@ def api_scan():
     return jsonify({"status": "scanned"})
 
 
+@app.route("/api/scalp/test_trade", methods=["POST"])
+def api_scalp_test_trade():
+    """
+    Manually fire ONE auto-scalp entry now (for testing when the market
+    isn't presenting a signal). Uses the current ATM strike + live premium
+    and goes through the real _auto_enter_position path, so it is managed,
+    counts toward the daily cap, and shows as auto_entered on the dashboard.
+    """
+    body = request.get_json(silent=True) or {}
+    direction = (body.get("direction") or "CALL").upper()
+    spot = float(state.get("last_price") or 0)
+    if spot <= 0:
+        return jsonify({"error": "no live NIFTY price"}), 400
+    strike = _select_strike(spot, direction)
+    opt_type = "CE" if direction == "CALL" else "PE"
+    exp = get_nearest_expiry(date.today())
+    if not exp:
+        return jsonify({"error": "no expiry resolved"}), 400
+    sym = f"NIFTY{exp.strftime('%y%m%d')}{strike}{opt_type}"
+    # live premium from the collector cache
+    prem = 0.0
+    try:
+        cache = json.loads(open(LIVE_CACHE_FILE).read())
+        e = cache.get(sym, {})
+        prem = float(e.get("ask") or e.get("price") or 0)
+    except Exception:
+        pass
+    if prem <= 0:
+        return jsonify({"error": f"no live premium for {sym} (is it in the collector's strike range?)"}), 400
+    trade = {
+        "symbol": sym, "direction": direction, "strategy": "scalp_manual_test",
+        "entry_premium": prem, "expiry": str(exp), "ml_prob": 0.5,
+        "final_score": 0.66, "index_price": round(spot, 1),
+    }
+    _auto_enter_position(trade, trade_mode="test")
+    return jsonify({"status": "entered", "symbol": sym, "entry_premium": prem,
+                    "scalp_trades_today": _scalp_trades_today()})
+
+
 # ── Paper Trading ─────────────────────────────────────────────────────────────
 
 
