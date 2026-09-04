@@ -95,18 +95,43 @@ def _select_strike(spot: float, direction: str, gap: int = NIFTY_STRIKE_GAP) -> 
 # trail that locks the win, quick target, and a time-stop that kills a dead
 # trade before theta eats it. Toggle with SCALP_MODE=1 (default on now).
 SCALP_MODE            = os.getenv("SCALP_MODE", "1") in ("1", "true", "True", "yes")
-SCALP_SL_PCT          = float(os.getenv("SCALP_SL_PCT", "0.08"))   # hard stop 8% -> small loss
-SCALP_TARGET_PCT      = float(os.getenv("SCALP_TARGET_PCT", "0.22"))  # book the pop at +22%
-SCALP_BE_TRIGGER_PCT  = float(os.getenv("SCALP_BE_TRIGGER_PCT", "0.04"))  # +4% -> SL to entry, locked
-SCALP_TRAIL_ACTIVATE  = float(os.getenv("SCALP_TRAIL_ACTIVATE", "0.06"))  # trail from +6% peak
-SCALP_TRAIL_RETENTION = float(os.getenv("SCALP_TRAIL_RETENTION", "0.65")) # keep 65% of peak gain
+SCALP_SL_PCT          = float(os.getenv("SCALP_SL_PCT", "0.08"))   # % backstop stop
+SCALP_BE_TRIGGER_PCT  = float(os.getenv("SCALP_BE_TRIGGER_PCT", "0.04"))  # +4% -> SL to entry
 SCALP_TIME_STOP_MIN   = float(os.getenv("SCALP_TIME_STOP_MIN", "12"))    # not green in 12min -> exit
+# Rupee-based management (per position, net of commission). ATM leg = high
+# gamma, so a scalp is defined in rupees, not %:
+SCALP_TARGET_RUPEES   = float(os.getenv("SCALP_TARGET_RUPEES", "1000"))  # take profit at +₹1000
+SCALP_LOCK_RUPEES     = float(os.getenv("SCALP_LOCK_RUPEES", "600"))     # once +₹600 seen, never exit below +₹600
+SCALP_MAX_LOSS_RUPEES = float(os.getenv("SCALP_MAX_LOSS_RUPEES", "600")) # hard stop at -₹600
+SCALP_LOTS            = int(os.getenv("SCALP_LOTS", "1"))               # fixed 1 lot
+SCALP_MAX_TRADES_DAY  = int(os.getenv("SCALP_MAX_TRADES_DAY", "15"))    # up to 15 entries/day
+SCALP_SCORE_THRESHOLD = float(os.getenv("SCALP_SCORE_THRESHOLD", "0.62"))  # loosened so ~15/day can trigger
 if SCALP_MODE:
     logger.info(
-        f"SCALP MODE on — SL {SCALP_SL_PCT:.0%}, target {SCALP_TARGET_PCT:.0%}, "
-        f"BE@+{SCALP_BE_TRIGGER_PCT:.0%} locked, trail@+{SCALP_TRAIL_ACTIVATE:.0%} "
-        f"keep {SCALP_TRAIL_RETENTION:.0%}, time-stop {SCALP_TIME_STOP_MIN:.0f}min"
+        f"SCALP MODE on — ATM leg, {SCALP_LOTS} lot, target +₹{SCALP_TARGET_RUPEES:.0f}, "
+        f"lock +₹{SCALP_LOCK_RUPEES:.0f}, max loss -₹{SCALP_MAX_LOSS_RUPEES:.0f}, "
+        f"time-stop {SCALP_TIME_STOP_MIN:.0f}min, score>={SCALP_SCORE_THRESHOLD}, "
+        f"cap {SCALP_MAX_TRADES_DAY}/day"
     )
+
+
+# Daily entry counter (date-aware; survives nothing, resets at midnight)
+_scalp_day = ""
+_scalp_count = 0
+
+
+def _scalp_trades_today() -> int:
+    global _scalp_day, _scalp_count
+    d = date.today().isoformat()
+    if d != _scalp_day:
+        _scalp_day, _scalp_count = d, 0
+    return _scalp_count
+
+
+def _scalp_count_inc():
+    global _scalp_count
+    _scalp_trades_today()
+    _scalp_count += 1
 
 app = Flask(__name__)
 CORS(app)  # Allow Next.js dev server on :3000
@@ -271,14 +296,22 @@ def _auto_enter_position(trade: dict, trade_mode: str = "test"):
         return
 
     ep = round(float(entry_premium), 2)
+    final_score = trade.get("final_score", 0.5)
     if SCALP_MODE:
-        sl_pct, target_pct = SCALP_SL_PCT, SCALP_TARGET_PCT
+        lots = SCALP_LOTS
+        units = LOT_SIZE * lots
+        # Stop is the TIGHTER of: 8% of premium, or a flat -₹SCALP_MAX_LOSS_RUPEES.
+        sl_from_pct = ep * (1 - SCALP_SL_PCT)
+        sl_from_rs  = ep - SCALP_MAX_LOSS_RUPEES / units
+        initial_sl  = round(max(sl_from_pct, sl_from_rs), 2)
+        # Target = +₹SCALP_TARGET_RUPEES (net of commission on the round trip).
+        target_price = round(ep + (SCALP_TARGET_RUPEES + COMMISSION) / units, 2)
     else:
         sl_pct = trade.get("sl_pct", INITIAL_SL_PCT)
         target_pct = trade.get("target_pct", TGT_PCT)
-    final_score = trade.get("final_score", 0.5)
-    initial_sl = round(ep * (1 - sl_pct), 2)
-    lots = _lots_for_score(final_score)
+        lots = _lots_for_score(final_score)
+        initial_sl = round(ep * (1 - sl_pct), 2)
+        target_price = round(ep * (1 + target_pct), 2)
     now_dt = datetime.now()
     position = {
         "id": int(now_dt.timestamp() * 1000),
@@ -290,7 +323,7 @@ def _auto_enter_position(trade: dict, trade_mode: str = "test"):
         "entry_premium": ep,
         "sl": initial_sl,
         "initial_sl": initial_sl,
-        "target": round(ep * (1 + target_pct), 2),
+        "target": target_price,
         "max_premium": ep,
         "trailing_active": False,
         "breakeven_locked": False,             # True once SL moved to entry
@@ -314,6 +347,8 @@ def _auto_enter_position(trade: dict, trade_mode: str = "test"):
     }
     positions.append(position)
     _save_open_positions()
+    if SCALP_MODE:
+        _scalp_count_inc()
     logger.info(
         f"AUTO-TRADE [{trade_mode.upper()}]: {trade['direction']} {trade['symbol']} "
         f"@ ₹{ep} | SL=₹{initial_sl} TGT=₹{position['target']} | {lots} lot(s) (score={final_score:.3f})"
@@ -1011,6 +1046,11 @@ def scan_market():
             logger.info(f"SKIP all signals: SL cooldown active ({remaining}min remaining)")
             return
 
+        # Scalp mode: hard cap on entries per day
+        if SCALP_MODE and _scalp_trades_today() >= SCALP_MAX_TRADES_DAY:
+            logger.info(f"SKIP all signals: scalp daily cap reached ({SCALP_MAX_TRADES_DAY} trades)")
+            return
+
         today = date.today()
         expiry = get_nearest_expiry(today)
         dte = get_days_to_expiry(today, expiry) if expiry else 0
@@ -1156,6 +1196,12 @@ def scan_market():
                     if not sustained_up:
                         continue
                 effective_threshold = max(effective_threshold, 0.78)
+
+            # Scalp mode trades more often at a lower score bar (all the other
+            # gates — signal, strat_prob, regime, cooldowns, premium-fall,
+            # prev-bar — still apply, so "good condition" is still enforced).
+            if SCALP_MODE:
+                effective_threshold = SCALP_SCORE_THRESHOLD
 
             if final_score < effective_threshold:
                 continue
@@ -1338,18 +1384,24 @@ def scan_market():
                 except Exception as e:
                     logger.debug(f"REST price fallback failed for {opt_symbol}: {e}")
 
-            # Dynamic SL and target based on signal quality (score-tiered)
-            # Targets are a ceiling — trailing SL (activates at +10%, ratchets up) is what
-            # captures most profit in practice. Hard target only fires on sharp one-way moves.
-            if final_score >= 0.75:
-                sl_pct, target_pct = 0.15, 0.55   # was 70% — most moves exhaust before that
-            elif final_score >= 0.65:
-                sl_pct, target_pct = 0.15, 0.45
+            # SL/target shown on the suggestion card.
+            if SCALP_MODE and opt_ltp:
+                _units = LOT_SIZE * SCALP_LOTS
+                sl_price = round(max(opt_ltp * (1 - SCALP_SL_PCT),
+                                     opt_ltp - SCALP_MAX_LOSS_RUPEES / _units), 2)
+                target_price = round(opt_ltp + (SCALP_TARGET_RUPEES + COMMISSION) / _units, 2)
+                sl_pct = round(1 - sl_price / opt_ltp, 3)
+                target_pct = round(target_price / opt_ltp - 1, 3)
             else:
-                sl_pct, target_pct = 0.12, 0.35
-
-            sl_price = round(opt_ltp * (1 - sl_pct), 2) if opt_ltp else None
-            target_price = round(opt_ltp * (1 + target_pct), 2) if opt_ltp else None
+                # Dynamic SL and target based on signal quality (score-tiered)
+                if final_score >= 0.75:
+                    sl_pct, target_pct = 0.15, 0.55
+                elif final_score >= 0.65:
+                    sl_pct, target_pct = 0.15, 0.45
+                else:
+                    sl_pct, target_pct = 0.12, 0.35
+                sl_price = round(opt_ltp * (1 - sl_pct), 2) if opt_ltp else None
+                target_price = round(opt_ltp * (1 + target_pct), 2) if opt_ltp else None
 
             # Deduplicate: if same signal fired within cooldown, refresh its timestamp
             cooldown_key = (opt_symbol, sig.direction, sig.strategy)
@@ -1363,7 +1415,7 @@ def scan_market():
                         existing["ml_prob"] = round(ml_prob, 4)
                         existing["final_score"] = round(final_score, 4)
                         existing["risk_label"] = risk_label
-                        existing["lots"] = _lots_for_score(final_score)
+                        existing["lots"] = (SCALP_LOTS if SCALP_MODE else _lots_for_score(final_score))
                         if opt_ltp:
                             existing["entry_premium"] = opt_ltp
                             existing["sl_price"] = sl_price
@@ -1371,7 +1423,7 @@ def scan_market():
                 continue
             _suggestion_cooldown[cooldown_key] = datetime.now()
 
-            lots = _lots_for_score(final_score)
+            lots = SCALP_LOTS if SCALP_MODE else _lots_for_score(final_score)
             trade = {
                 "time": datetime.now().strftime("%H:%M:%S"),
                 "symbol": opt_symbol,
@@ -1986,32 +2038,36 @@ def _update_position_price(pos: dict, live_prem: float):
     current_profit_pct = (live_prem - ep) / ep
 
     if SCALP_MODE:
-        # ── Scalp: fast breakeven + aggressive fixed trail + time-stop ──
-        # 1) As soon as the trade is +SCALP_BE_TRIGGER_PCT, park SL at entry
-        #    and lock it — from here the worst case is ~scratch, not a loss.
+        units = pos["lot_size"] or LOT_SIZE
+        unreal      = (live_prem - ep) * units - COMMISSION
+        peak_unreal = (pos["max_premium"] - ep) * units - COMMISSION
+
+        # 1) Fast breakeven: at +SCALP_BE_TRIGGER_PCT, park SL at entry+buffer.
         if current_profit_pct >= SCALP_BE_TRIGGER_PCT and not pos["breakeven_locked"]:
-            be_sl = round(ep * 1.002, 2)
+            be_sl = round(ep + COMMISSION / units + ep * 0.001, 2)
             if be_sl > pos["sl"]:
                 pos["sl"] = be_sl
             pos["breakeven_locked"] = True
-            logger.info(f"SCALP BE {pos['symbol']}: SL -> ₹{pos['sl']} locked (+{current_profit_pct:.1%})")
+            logger.info(f"SCALP BE {pos['symbol']}: SL -> ₹{pos['sl']} (+{current_profit_pct:.1%})")
 
-        # 2) Trail from a low activation, keeping a big fixed slice of the peak
-        peak_gain = (pos["max_premium"] - ep) / ep if ep > 0 else 0
-        if peak_gain >= SCALP_TRAIL_ACTIVATE:
-            pos["trailing_active"] = True
-            trail_sl = round(ep + (pos["max_premium"] - ep) * SCALP_TRAIL_RETENTION, 2)
-            if trail_sl > pos["sl"]:
-                pos["sl"] = trail_sl
+        # 2) Rupee profit lock: once the trade has *seen* +₹SCALP_LOCK_RUPEES,
+        #    ratchet SL to the premium that still nets +₹SCALP_LOCK_RUPEES, so
+        #    it can never come back to a loss (the "1000 → 600" band: aim
+        #    +₹1000 target, protect +₹600).
+        if peak_unreal >= SCALP_LOCK_RUPEES:
+            lock_sl = round(ep + (SCALP_LOCK_RUPEES + COMMISSION) / units, 2)
+            if lock_sl > pos["sl"]:
+                pos["sl"] = lock_sl
+                pos["trailing_active"] = True
+                logger.info(f"SCALP LOCK {pos['symbol']}: SL -> ₹{lock_sl} (peak +₹{peak_unreal:.0f}, protect +₹{SCALP_LOCK_RUPEES:.0f})")
 
-        # 3) Time-stop: if it hasn't gone green within SCALP_TIME_STOP_MIN,
-        #    close it now — a scalp that isn't working is just theta bleed.
+        # 3) Time-stop: not green within SCALP_TIME_STOP_MIN -> close now.
         try:
             entry_dt = datetime.fromisoformat(
                 pos.get("entry_time_dt") or pos["journey"][0]["ts"])
             held_min = (now - entry_dt).total_seconds() / 60
             if held_min >= SCALP_TIME_STOP_MIN and current_profit_pct < SCALP_BE_TRIGGER_PCT:
-                pnl = round((live_prem - ep) * pos["lot_size"] - COMMISSION, 2)
+                pnl = round(unreal, 2)
                 pos.update({
                     "status": "CLOSED",
                     "exit_time": now.strftime("%H:%M:%S"),
@@ -2025,7 +2081,8 @@ def _update_position_price(pos: dict, live_prem: float):
         except Exception:
             pass
 
-        # fall through to the SL/target auto-exit checks below
+        # SL (rupee/pct stop + lock) and target (+₹SCALP_TARGET_RUPEES premium,
+        # set at entry) are enforced by the auto-exit checks below.
         _skip_legacy_trail = True
     else:
         _skip_legacy_trail = False
@@ -2485,9 +2542,12 @@ def api_paper_enter():
         return jsonify({"error": "Could not determine entry premium — no DB candle, no live data, and strike parse failed"}), 400
 
     ep = round(float(entry_premium), 2)
-    # Scalp mode: fixed tight SL + quick target. Otherwise dynamic by score.
     if SCALP_MODE and not body.get("sl_pct") and not body.get("target_pct"):
-        sl_pct, target_pct = SCALP_SL_PCT, SCALP_TARGET_PCT
+        # Scalp: fixed 1 lot, rupee-defined stop/target (matches auto path)
+        lots  = SCALP_LOTS
+        units = LOT_SIZE * lots
+        initial_sl   = round(max(ep * (1 - SCALP_SL_PCT), ep - SCALP_MAX_LOSS_RUPEES / units), 2)
+        target_price = round(ep + (SCALP_TARGET_RUPEES + COMMISSION) / units, 2)
     else:
         sl_pct = body.get("sl_pct") or (
             0.15 if final_score >= 0.75 else
@@ -2499,8 +2559,9 @@ def api_paper_enter():
             0.55 if final_score >= 0.65 else
             0.40
         )
-    initial_sl = round(ep * (1 - sl_pct), 2)
-    lots = _lots_for_score(final_score)
+        lots = _lots_for_score(final_score)
+        initial_sl   = round(ep * (1 - sl_pct), 2)
+        target_price = round(ep * (1 + target_pct), 2)
     position = {
         "id": int(datetime.now().timestamp() * 1000),
         "entry_time": datetime.now().strftime("%H:%M:%S"),
@@ -2510,7 +2571,7 @@ def api_paper_enter():
         "entry_premium": ep,
         "sl": initial_sl,
         "initial_sl": initial_sl,
-        "target": round(ep * (1 + target_pct), 2),
+        "target": target_price,
         "max_premium": ep,       # tracks highest premium seen (for trailing SL)
         "trailing_active": False,  # becomes True once profit > TRAIL_ACTIVATE_PCT
         "lot_size": LOT_SIZE * lots,
