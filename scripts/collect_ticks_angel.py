@@ -537,68 +537,67 @@ def main():
 
     from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
-    sws = SmartWebSocketV2(
-        tokens["auth_token"], tokens["api_key"],
-        tokens["client_id"], tokens["feed_token"],
-        max_retry_attempt=50, retry_strategy=1, retry_delay=5,
-    )
-
     token_list = [{"exchangeType": NFO_EXCHANGE_TYPE, "tokens": all_tokens}]
-
-    def _on_open(_wsapp):
-        logger.info(f"SmartWebSocket open; subscribing to {len(all_tokens)} tokens on NFO "
-                    f"({', '.join(sorted(TOKEN_SYMBOL.values()))})...")
-        sws.subscribe("nifty_feed", SNAP_QUOTE_MODE, token_list)
-
-    def _on_data(_wsapp, message):
-        try:
-            if isinstance(message, (bytes, bytearray)):
-                return  # library also delivers parsed dicts; ignore raw frames
-            tick = normalize_tick(message)
-            if tick:
-                on_tick(tick)
-        except Exception as e:
-            logger.error(f"tick handling error: {e}")
-
-    def _on_error(_wsapp, error):
-        logger.error(f"SmartWebSocket error: {error}")
-
-    def _on_close(_wsapp):
-        logger.warning("SmartWebSocket closed.")
-
-    sws.on_open = _on_open
-    sws.on_data = _on_data
-    sws.on_error = _on_error
-    sws.on_close = _on_close
 
     threading.Thread(target=_cache_flusher, daemon=True).start()
     threading.Thread(target=_candle_timer, daemon=True).start()
 
+    def _build_sws(tok):
+        sws = SmartWebSocketV2(
+            tok["auth_token"], tok["api_key"], tok["client_id"], tok["feed_token"],
+            max_retry_attempt=3, retry_strategy=1, retry_delay=5,
+        )
+        sws.on_open  = lambda _w: (
+            logger.info(f"SmartWebSocket open; subscribing to {len(all_tokens)} tokens on NFO "
+                        f"({', '.join(sorted(TOKEN_SYMBOL.values()))})..."),
+            sws.subscribe("nifty_feed", SNAP_QUOTE_MODE, token_list),
+        )
+        def _on_data(_w, message):
+            try:
+                if isinstance(message, (bytes, bytearray)):
+                    return
+                tk = normalize_tick(message)
+                if tk:
+                    on_tick(tk)
+            except Exception as e:
+                logger.error(f"tick handling error: {e}")
+        sws.on_data  = _on_data
+        sws.on_error = lambda _w, err: logger.error(f"SmartWebSocket error: {err}")
+        sws.on_close = lambda _w: logger.warning("SmartWebSocket closed.")
+        return sws
+
+    sws = _build_sws(tokens)
     if args.test:
         threading.Thread(target=_test_watchdog, args=(sws,), daemon=True).start()
-
-    logger.info("Connecting to SmartWebSocket (blocking)...")
-    # SmartWebSocketV2.connect() returns when the socket dies past its internal
-    # retry budget. Supervise it here so a dropped feed doesn't end the process
-    # (the Flask _ensure_collector fallback only checks every 30s).
-    backoff = 5
-    while running and not args.test:
-        try:
-            sws.connect()
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            logger.error(f"SmartWebSocket connect loop ended: {e}")
-        if not running:
-            break
-        logger.warning(f"Feed dropped; reconnecting in {backoff}s...")
-        time.sleep(backoff)
-        backoff = min(backoff * 2, 60)
-    if args.test:
         try:
             sws.connect()
         except Exception as e:
             logger.error(f"SmartWebSocket connect loop ended: {e}")
+    else:
+        # Supervised loop. When the socket dies past its retry budget we
+        # re-LOGIN (a stale feed token — e.g. after the Flask backend
+        # re-authenticated on the same Angel account — is the usual cause of
+        # a permanent reconnect failure) and rebuild the socket.
+        backoff = 5
+        while running:
+            try:
+                sws.connect()
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                logger.error(f"SmartWebSocket connect loop ended: {e}")
+            if not running:
+                break
+            logger.warning(f"Feed dropped; re-login + reconnect in {backoff}s...")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+            try:
+                fresh, _ = angel_login()
+                sws = _build_sws(fresh)
+                backoff = 5
+                logger.info("Re-login OK; new SmartWebSocket built.")
+            except Exception as e:
+                logger.error(f"Re-login failed: {e}")
 
     # flush leftovers
     for symbol, ticks in candle_buffer.items():

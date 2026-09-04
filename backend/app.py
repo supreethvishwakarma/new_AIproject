@@ -106,6 +106,12 @@ SCALP_MAX_LOSS_RUPEES = float(os.getenv("SCALP_MAX_LOSS_RUPEES", "600")) # hard 
 SCALP_LOTS            = int(os.getenv("SCALP_LOTS", "1"))               # fixed 1 lot
 SCALP_MAX_TRADES_DAY  = int(os.getenv("SCALP_MAX_TRADES_DAY", "15"))    # up to 15 entries/day
 SCALP_SCORE_THRESHOLD = float(os.getenv("SCALP_SCORE_THRESHOLD", "0.62"))  # loosened so ~15/day can trigger
+# Scalps trade the whole session, not just the morning. Window is minutes
+# from the 9:15 open: skip the first 15, allow entries through 15:00 IST (345).
+SCALP_FIRST_ENTRY_MIN = int(os.getenv("SCALP_FIRST_ENTRY_MIN", "15"))
+SCALP_LAST_ENTRY_MIN  = int(os.getenv("SCALP_LAST_ENTRY_MIN", "345"))
+SCALP_STRAT_COOLDOWN_SEC = int(os.getenv("SCALP_STRAT_COOLDOWN_SEC", "300"))  # 5 min re-fire gap
+SCALP_SL_PAUSE_MIN    = int(os.getenv("SCALP_SL_PAUSE_MIN", "10"))  # pause after 2 SLs
 if SCALP_MODE:
     logger.info(
         f"SCALP MODE on — ATM leg, {SCALP_LOTS} lot, target +₹{SCALP_TARGET_RUPEES:.0f}, "
@@ -213,7 +219,8 @@ def _persist_closed_trade(pos: dict):
     if reason == "SL_HIT":
         _consecutive_sl_hits += 1
         if _consecutive_sl_hits >= 2:
-            _sl_pause_until = datetime.now() + timedelta(minutes=30)
+            _pause_min = SCALP_SL_PAUSE_MIN if SCALP_MODE else 30
+            _sl_pause_until = datetime.now() + timedelta(minutes=_pause_min)
             logger.warning(
                 f"SL COOLDOWN ACTIVATED: {_consecutive_sl_hits} consecutive SL hits — "
                 f"pausing entries until {_sl_pause_until.strftime('%H:%M')}"
@@ -1026,16 +1033,21 @@ def scan_market():
         _prof = _get_rp_t(_RL_t.MEDIUM)
         _now_ist = now_ist()
         minutes_from_open = max(0, _now_ist.hour * 60 + _now_ist.minute - 555)  # 9:15 IST = 555 min
-        if minutes_from_open < _prof.skip_first_min:
-            return
-        if minutes_from_open > (375 - _prof.skip_last_min):
-            return
-        if minutes_from_open > _prof.afternoon_cut:
-            logger.info(
-                f"SKIP all signals: past afternoon_cut "
-                f"({minutes_from_open}min from open > {_prof.afternoon_cut}min)"
-            )
-            return
+        if SCALP_MODE:
+            # Scalp: trade the whole session up to SCALP_LAST_ENTRY_MIN
+            if minutes_from_open < SCALP_FIRST_ENTRY_MIN or minutes_from_open > SCALP_LAST_ENTRY_MIN:
+                return
+        else:
+            if minutes_from_open < _prof.skip_first_min:
+                return
+            if minutes_from_open > (375 - _prof.skip_last_min):
+                return
+            if minutes_from_open > _prof.afternoon_cut:
+                logger.info(
+                    f"SKIP all signals: past afternoon_cut "
+                    f"({minutes_from_open}min from open > {_prof.afternoon_cut}min)"
+                )
+                return
 
         # ── Consecutive-SL cooldown (added 2026-04-15, ported from backtest) ─
         # After 2 SL hits in a row, pause new entries for 30 minutes. Resets
@@ -1213,11 +1225,12 @@ def scan_market():
             # entries of the same (strategy, direction) for 15 min after one
             # fires, regardless of strike.
             sd_key = (sig.strategy, sig.direction)
+            _sd_cooldown = SCALP_STRAT_COOLDOWN_SEC if SCALP_MODE else STRATEGY_DIRECTION_COOLDOWN_SECS
             last_sd = _last_entry_by_strat_dir.get(sd_key)
             if last_sd is not None:
                 age = (datetime.now() - last_sd).total_seconds()
-                if age < STRATEGY_DIRECTION_COOLDOWN_SECS:
-                    remaining = int((STRATEGY_DIRECTION_COOLDOWN_SECS - age) / 60)
+                if age < _sd_cooldown:
+                    remaining = int((_sd_cooldown - age) / 60)
                     logger.info(
                         f"SKIP {sig.strategy} {sig.direction}: same-strat/dir cooldown "
                         f"({remaining}min left, last fired {int(age/60)}min ago) — "
