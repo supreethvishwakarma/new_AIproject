@@ -147,7 +147,7 @@ class BacktestResult:
                 trade_dict["exit_time"] = str(trade_dict["exit_time"])
             data["trades"].append(trade_dict)
 
-        with open(filepath, "w") as f:
+        with open(filepath, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         logger.info(f"Backtest results exported to {filepath}")
 
@@ -203,7 +203,7 @@ class BacktestResult:
         lines.append("END OF REPORT")
         lines.append("=" * 80)
 
-        with open(filepath, "w") as f:
+        with open(filepath, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
         logger.info(f"Backtest report exported to {filepath}")
 

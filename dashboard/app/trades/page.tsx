@@ -3,7 +3,7 @@
 import React, { useEffect, useState, useCallback } from "react";
 import Sidebar from "@/components/Sidebar";
 import PnlBarChart from "@/components/PnlBarChart";
-import { fetchJSON, type Trade, type LiveTrade, type JourneyPoint } from "@/lib/api";
+import { fetchJSON, API_BASE, type Trade, type LiveTrade, type JourneyPoint } from "@/lib/api";
 import { toDateStr, toISTTimeFull, toISTTime } from "@/lib/time";
 import { useTradingMode } from "@/contexts/TradingModeContext";
 import { Download, Activity } from "lucide-react";
@@ -358,8 +358,8 @@ export default function TradesPage() {
           </div>
           <a
             href={tabMode === "backtest"
-              ? `http://localhost:5050/api/trades/history?risk=${risk}`
-              : `http://localhost:5050/api/paper/trades?mode=${tradingMode}`}
+              ? `${API_BASE}/api/trades/history?risk=${risk}`
+              : `${API_BASE}/api/paper/trades?mode=${tradingMode}`}
             download={tabMode === "backtest" ? `bt_trades_${risk}.json` : `live_trades_${tradingMode}.json`}
             className="t-btn flex items-center gap-1.5"
           >
