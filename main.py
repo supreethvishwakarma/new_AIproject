@@ -206,18 +206,22 @@ def run_train():
     """
     from features.feature_engine import build_macro_features, build_micro_features
     from models.train_model import train_all_models
+    from config.settings import TD_INDEX_FUTURES_SYMBOLS
 
     logger.info("=" * 60)
     logger.info("MODE: TRAIN - training ML models from DB data")
     logger.info("=" * 60)
 
     for symbol in SYMBOLS:
-        logger.info(f"Building features for {symbol}...")
-        macro_df = build_macro_features(symbol)
-        micro_df = build_micro_features(symbol)
+        # minute_candles / tick_data are stored under the continuous-future
+        # symbol ("NIFTY-I"), which is also what the live scanner reads.
+        data_symbol = TD_INDEX_FUTURES_SYMBOLS.get(symbol, symbol)
+        logger.info(f"Building features for {symbol} (data symbol: {data_symbol})...")
+        macro_df = build_macro_features(data_symbol)
+        micro_df = build_micro_features(data_symbol)
 
         if macro_df.empty:
-            logger.warning(f"No macro features for {symbol}. Run 'ingest' first.")
+            logger.warning(f"No macro features for {data_symbol}. Run 'ingest' first.")
             continue
 
         logger.info(f"Training models for {symbol}...")

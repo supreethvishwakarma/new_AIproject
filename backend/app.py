@@ -2187,10 +2187,29 @@ def _kill_stalled_collector():
     time.sleep(1)
 
 
+def _external_collector_running() -> bool:
+    """
+    True if *some* collector is alive. It rewrites LIVE_CACHE_FILE every second
+    (even with an empty payload while its WebSocket is still connecting), so a
+    cache file touched in the last ~2 min means a process is up — just not
+    delivering fresh ticks yet. Distinguishes "reconnecting" from "not running"
+    so we don't stack a second SmartWebSocket session on the same account.
+    """
+    try:
+        return (time.time() - os.path.getmtime(LIVE_CACHE_FILE)) < 120
+    except OSError:
+        return False
+
+
 def _ensure_collector():
     """Auto-start the tick collector if it's market hours and prices aren't fresh."""
     global _collector_process
     import subprocess
+
+    # Opt out entirely when the collector is managed externally (systemd, a
+    # hand-run nohup, a separate supervisor). COLLECTOR_AUTOSTART=0 disables.
+    if os.getenv("COLLECTOR_AUTOSTART", "1") not in ("1", "true", "True", "yes"):
+        return
 
     now = now_ist()
     # Only auto-start during market hours (9:00 - 15:35 IST, weekdays)
@@ -2202,8 +2221,21 @@ def _ensure_collector():
     if _cache_prices_are_fresh():
         return  # collector is alive and delivering real ticks
 
-    # Prices are stale — kill whatever is running and restart fresh
-    logger.warning("Tick cache prices are stale. Killing any existing collector and restarting.")
+    # A collector we launched is still alive — give it time to connect rather
+    # than stacking a second process (multiple SmartWebSocket sessions on one
+    # Angel account fight over the single feed slot).
+    if _collector_process is not None and _collector_process.poll() is None:
+        logger.info("Collector process still alive but prices not fresh yet; waiting.")
+        return
+
+    # An externally-run collector is already up (e.g. started by hand) — don't
+    # stack another one on top of it.
+    if _external_collector_running():
+        logger.info("A tick collector is already running (started externally); not starting another.")
+        return
+
+    # Prices are stale and nothing is collecting — start fresh
+    logger.warning("Tick cache prices are stale and no collector running. Starting one.")
     _kill_stalled_collector()
     _collector_process = None
 
