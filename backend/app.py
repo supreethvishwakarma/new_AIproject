@@ -14,6 +14,7 @@ Open: http://localhost:5050
 """
 
 import os
+import re
 import sys
 import json
 import threading
@@ -45,6 +46,48 @@ from utils.logger import get_logger
 from utils.helpers import now_ist
 
 logger = get_logger("dashboard")
+
+# ── Strike selection ────────────────────────────────────────────────────────
+# Which leg to trade relative to ATM, using the OpenAlgo-style label:
+#   ATM, ITM1..ITMn (deeper in the money), OTM1..OTMn (further out).
+# Intraday option BUYING is normally done ITM1 (delta ~0.6-0.7, far less theta
+# bleed and slippage than a cheap far-OTM strike).
+#   CALL ITM  -> LOWER strike ;  PUT ITM  -> HIGHER strike
+#   CALL OTM  -> HIGHER strike;  PUT OTM  -> LOWER strike
+NIFTY_STRIKE_GAP = 50
+
+
+def _parse_strike_offset(spec) -> int:
+    """'ATM'->0, 'ITM1'->-1, 'ITM2'->-2, 'OTM1'->+1 ; bare int allowed (neg = ITM)."""
+    if spec is None:
+        return 0
+    s = str(spec).strip().upper()
+    if s in ("", "ATM"):
+        return 0
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    m = re.fullmatch(r"(ITM|OTM)\s*(\d+)", s)
+    if not m:
+        logger.warning(f"Unrecognised STRIKE_SELECTION {spec!r}; using ATM")
+        return 0
+    n = int(m.group(2))
+    return -n if m.group(1) == "ITM" else n
+
+
+_STRIKE_STEPS = _parse_strike_offset(os.getenv("STRIKE_SELECTION", "ITM1"))
+_STRIKE_LABEL = ("ATM" if _STRIKE_STEPS == 0
+                 else f"ITM{abs(_STRIKE_STEPS)}" if _STRIKE_STEPS < 0
+                 else f"OTM{_STRIKE_STEPS}")
+logger.info(f"Strike selection: {_STRIKE_LABEL} ({_STRIKE_STEPS} ladder steps from ATM)")
+
+
+def _select_strike(spot: float, direction: str, gap: int = NIFTY_STRIKE_GAP) -> int:
+    """ATM strike for `spot`, shifted to the configured ITM/OTM leg."""
+    atm = round(spot / gap) * gap
+    step = _STRIKE_STEPS if direction == "CALL" else -_STRIKE_STEPS
+    return int(atm + step * gap)
 
 app = Flask(__name__)
 CORS(app)  # Allow Next.js dev server on :3000
@@ -136,6 +179,49 @@ def _persist_closed_trade(pos: dict):
             logger.debug(f"SL streak broken ({reason}): counter reset")
         _consecutive_sl_hits = 0
 
+    _save_open_positions()  # a close removes it from the open set
+
+
+# ── Open-position persistence ───────────────────────────────────────────────
+# Open paper positions live in memory; snapshot them to disk so they survive a
+# backend restart (closed trades already persist via the JSONL above).
+_OPEN_POS_FILE = _PAPER_TRADES_DIR / "open_positions.json"
+_last_open_save = 0.0
+
+
+def _save_open_positions(force: bool = True):
+    global _last_open_save
+    now = time.time()
+    if not force and (now - _last_open_save) < 15:
+        return
+    _last_open_save = now
+    try:
+        _PAPER_TRADES_DIR.mkdir(exist_ok=True)
+        snap = {m: [p for p in ps if p.get("status") == "OPEN"]
+                for m, ps in paper_positions_by_mode.items()}
+        tmp = _OPEN_POS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(snap, default=str))
+        tmp.replace(_OPEN_POS_FILE)
+    except Exception as e:
+        logger.warning(f"Failed to save open positions: {e}")
+
+
+def _load_open_positions():
+    if not _OPEN_POS_FILE.exists():
+        return
+    try:
+        snap = json.loads(_OPEN_POS_FILE.read_text())
+        n = 0
+        for mode, ps in snap.items():
+            keep = [p for p in ps if p.get("status") == "OPEN"]
+            paper_positions_by_mode.setdefault(mode, [])
+            paper_positions_by_mode[mode].extend(keep)
+            n += len(keep)
+        if n:
+            logger.info(f"Restored {n} open paper position(s) from disk")
+    except Exception as e:
+        logger.warning(f"Failed to load open positions: {e}")
+
 
 def _get_mode_positions(mode: str = None) -> list:
     """Return positions list for given mode (from request arg or explicit)."""
@@ -205,6 +291,7 @@ def _auto_enter_position(trade: dict, trade_mode: str = "test"):
         "journey": [],   # [{ts, option_price, nifty_price}] — populated by tick monitor
     }
     positions.append(position)
+    _save_open_positions()
     logger.info(
         f"AUTO-TRADE [{trade_mode.upper()}]: {trade['direction']} {trade['symbol']} "
         f"@ ₹{ep} | SL=₹{initial_sl} TGT=₹{position['target']} | {lots} lot(s) (score={final_score:.3f})"
@@ -429,6 +516,7 @@ def initialize():
 
     state["status"] = "ready"
     _load_paper_trade_history()
+    _load_open_positions()
     logger.info("Dashboard initialized.")
 
     # ── Startup backfill: fill today's missing candles from 9:15 to now ──────
@@ -1142,10 +1230,10 @@ def scan_market():
                 now_ts = datetime.now()
                 window_start = now_ts - timedelta(seconds=30)
                 # Build the option symbol (same logic as below)
-                _atm_probe = round(latest.get("close", 0) / 50) * 50
+                _strike_probe = _select_strike(latest.get("close", 0), sig.direction)
                 _opt_type_probe = "CE" if sig.direction == "CALL" else "PE"
                 _exp_code_probe = expiry.strftime("%y%m%d") if expiry else "000000"
-                _opt_sym_probe = f"NIFTY{_exp_code_probe}{_atm_probe}{_opt_type_probe}"
+                _opt_sym_probe = f"NIFTY{_exp_code_probe}{_strike_probe}{_opt_type_probe}"
 
                 prem_ticks = read_sql(
                     "SELECT timestamp, price FROM tick_data "
@@ -1169,10 +1257,11 @@ def scan_market():
             except Exception as _prem_err:
                 logger.debug(f"option premium gate skipped: {_prem_err}")
 
-            atm = round(latest.get("close", 0) / 50) * 50
+            strike = _select_strike(latest.get("close", 0), sig.direction)
+            atm = round(latest.get("close", 0) / 50) * 50   # kept for logging/feature use
             opt_type = "CE" if sig.direction == "CALL" else "PE"
             exp_code = expiry.strftime("%y%m%d") if expiry else "000000"
-            opt_symbol = f"NIFTY{exp_code}{atm}{opt_type}"
+            opt_symbol = f"NIFTY{exp_code}{strike}{opt_type}"
 
             # Risk label based on score confidence
             if final_score >= 0.70:
@@ -2117,6 +2206,7 @@ def _tick_monitor_loop():
 
         except Exception as e:
             logger.error(f"Tick monitor error: {e}")
+        _save_open_positions(force=False)   # throttled: persists journey / live P&L
         time.sleep(1)
 
 
@@ -2367,6 +2457,7 @@ def api_paper_enter():
     }
     position["mode"] = trade_mode
     positions.append(position)
+    _save_open_positions()
     logger.info(f"PAPER ENTER [{trade_mode}]: {direction} {symbol} @ ₹{ep} | SL={position['sl']} TGT={position['target']} | {lots} lot(s) (score={final_score:.3f})")
 
     # Ensure tick monitor and data collector are running
