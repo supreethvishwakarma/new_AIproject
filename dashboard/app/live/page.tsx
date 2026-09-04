@@ -84,6 +84,35 @@ export default function LivePage() {
     return () => { es.close(); esRef.current = null; };
   }, []);
 
+  // Polling fallback — some proxies/tunnels (e.g. cloudflare quick tunnels)
+  // don't pass text/event-stream, so the SSE above never delivers. Whenever it
+  // isn't connected, poll the plain REST endpoints so the page still updates.
+  useEffect(() => {
+    if (sseConnected) return;
+    let stop = false;
+    const tick = async () => {
+      if (stop) return;
+      try {
+        const [st, lp] = await Promise.all([
+          fetchJSON<any>("/api/state").catch(() => null),
+          fetchJSON<any>("/api/live/prices").catch(() => null),
+        ]);
+        if (st) {
+          setState(prev => ({ ...(prev ?? {} as LiveState), ...st } as LiveState));
+          setLastUpdate(new Date().toLocaleTimeString("en-IN"));
+          if (st.auto_trade_enabled !== undefined) setAutoTradeState(st.auto_trade_enabled);
+        }
+        if (lp?.prices) {
+          setLivePrices(lp.prices);
+          if (lp.age_seconds !== undefined && lp.age_seconds !== null) setTickCacheAge(lp.age_seconds);
+        }
+      } catch {}
+    };
+    tick();
+    const iv = setInterval(tick, 2000);
+    return () => { stop = true; clearInterval(iv); };
+  }, [sseConnected]);
+
   // Derived: positions and PnL for current mode
   const positions = positionsByMode[mode] ?? [];
   const totalOpenPnl = pnlByMode[mode]?.open ?? 0;
