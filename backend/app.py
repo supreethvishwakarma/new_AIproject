@@ -228,7 +228,11 @@ TRAIL_ACTIVATE_PCT = 0.10   # Start trailing once profit > 10%
 TRAIL_FACTOR = 0.50         # Trail SL at 50% of max profit
 TGT_PCT = 0.50              # Target at 50% above entry
 COMMISSION = 40.0
-LIVE_CACHE_FILE = "/tmp/td_live_prices.json"
+# Live-price cache written ~1x/sec by the tick collector. Overridable via .env
+# (each project fork MUST use its own path — a shared /tmp file cross-feeds
+# prices between the NIFTY and MCX apps).
+LIVE_CACHE_FILE = os.getenv("LIVE_CACHE_FILE") or "/tmp/td_live_prices.json"
+logger.info(f"LIVE_CACHE_FILE resolved to: {LIVE_CACHE_FILE}")
 
 # Background processes
 _tick_monitor_thread = None
@@ -2155,18 +2159,36 @@ def _cache_prices_are_fresh(max_age_secs: int = 90) -> bool:
     return False
 
 
+_COLLECTOR_SCRIPT = os.getenv("COLLECTOR_SCRIPT", "collect_ticks_angel.py")
+
+
+def _venv_python(project_root: Path) -> Path:
+    """Path to the venv interpreter, cross-platform (Scripts/ on Windows, bin/ elsewhere)."""
+    win = project_root / ".venv" / "Scripts" / "python.exe"
+    nix = project_root / ".venv" / "bin" / "python"
+    return win if win.exists() else nix
+
+
 def _kill_stalled_collector():
-    """Kill any running collect_ticks.py process (stalled or otherwise)."""
-    try:
-        import subprocess as sp
-        sp.run(["pkill", "-f", "collect_ticks.py"], capture_output=True)
-        time.sleep(1)
-    except Exception:
-        pass
+    """Kill any running tick-collector process (stalled or otherwise)."""
+    import subprocess as sp
+    for pat in ("collect_ticks_angel.py", "collect_ticks.py"):
+        try:
+            sp.run(["pkill", "-f", pat], capture_output=True)
+        except Exception:
+            pass
+        try:  # Windows
+            sp.run(
+                ["taskkill", "/F", "/FI", f"WINDOWTITLE eq {pat}"],
+                capture_output=True,
+            )
+        except Exception:
+            pass
+    time.sleep(1)
 
 
 def _ensure_collector():
-    """Auto-start collect_ticks.py if it's market hours and not delivering fresh prices."""
+    """Auto-start the tick collector if it's market hours and prices aren't fresh."""
     global _collector_process
     import subprocess
 
@@ -2187,17 +2209,22 @@ def _ensure_collector():
 
     # Start collector
     project_root = Path(__file__).resolve().parent.parent
-    collector_script = project_root / "scripts" / "collect_ticks.py"
-    python_bin = project_root / ".venv" / "bin" / "python"
+    collector_script = project_root / "scripts" / _COLLECTOR_SCRIPT
+    if not collector_script.exists():
+        collector_script = project_root / "scripts" / "collect_ticks.py"
+    python_bin = _venv_python(project_root)
+    log_path = project_root / "logs" / f"collector_{now:%Y%m%d}.log"
     if collector_script.exists() and python_bin.exists():
-        logger.info("Auto-starting collect_ticks.py for live tick data...")
+        logger.info(f"Auto-starting {collector_script.name} for live tick data...")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        _log_fh = open(log_path, "a", encoding="utf-8")
         _collector_process = subprocess.Popen(
             [str(python_bin), str(collector_script)],
             cwd=str(project_root),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=_log_fh,
+            stderr=subprocess.STDOUT,
         )
-        logger.info(f"collect_ticks.py started (PID={_collector_process.pid})")
+        logger.info(f"{collector_script.name} started (PID={_collector_process.pid}) -> {log_path.name}")
 
 
 @app.route("/api/paper/enter", methods=["POST"])
@@ -2353,8 +2380,7 @@ def api_paper_positions():
     open_symbols = list({p["symbol"] for p in positions if p["status"] == "OPEN"})
     live_prices: dict = {}
 
-    # 1. Try in-memory cache file written by collect_ticks.py every ~1s
-    LIVE_CACHE_FILE = "/tmp/td_live_prices.json"
+    # 1. Try in-memory cache file written by the tick collector every ~1s
     cache_age = float("inf")
     try:
         mtime = os.path.getmtime(LIVE_CACHE_FILE)
@@ -2488,8 +2514,7 @@ def api_backtest_journey(risk, trade_idx):
 
 @app.route("/api/live/prices")
 def api_live_prices():
-    """Return the latest tick prices from collect_ticks.py cache file."""
-    LIVE_CACHE_FILE = "/tmp/td_live_prices.json"
+    """Return the latest tick prices from the tick-collector cache file."""
     try:
         mtime = os.path.getmtime(LIVE_CACHE_FILE)
         age = time.time() - mtime
