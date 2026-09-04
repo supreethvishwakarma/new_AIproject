@@ -77,6 +77,7 @@ _first_tick_logged = False
 candle_buffer: dict[str, list] = {}     # symbol -> ticks for the current minute
 last_minute: dict[str, datetime] = {}   # symbol -> minute bucket last seen
 live_price_cache: dict[str, dict] = {}  # symbol -> {price, bid, ask, ts}
+TOKEN_SYMBOL: dict[str, str] = {}       # angel token (str) -> our symbol name
 _last_tick_wall = time.time()
 
 
@@ -148,6 +149,90 @@ def resolve_future_token(underlying: str, override_token: str = "") -> dict:
         f"token={info['token']} expiry={info['expiry']} lot={info['lotsize']}"
     )
     return info
+
+
+_OPT_TOKEN_CACHE = BASE_DIR / "logs" / "nifty_option_tokens.json"
+
+
+def _ref_price(adapter, fut_token: str) -> float:
+    """
+    Reference price for ATM strike selection. Uses the NIFTY *future* LTP
+    (same basis the backend scanner uses when it builds the option symbol
+    from `minute_candles` NIFTY-I close), not the spot index — the two
+    differ by the futures basis and picking spot would offset every strike.
+    """
+    try:
+        r = adapter._smart_api.ltpData("NFO", "NIFTY-FUT", str(fut_token))
+        p = float((r or {}).get("data", {}).get("ltp") or 0)
+        if p > 0:
+            return p
+    except Exception as e:
+        logger.warning(f"future LTP fetch failed: {e}")
+    try:
+        r = adapter._smart_api.ltpData("NSE", "NIFTY", "26000")  # spot fallback
+        return float((r or {}).get("data", {}).get("ltp") or 0)
+    except Exception:
+        return 0.0
+
+
+def resolve_option_tokens(underlying: str, expiry_iso: str, spot: float,
+                          n_strikes: int = 2, strike_step: int = 50) -> list[dict]:
+    """
+    ATM +/- n_strikes CE & PE for `expiry_iso` (YYYY-MM-DD) from Angel's
+    instrument master. Returns [{token, symbol, strike, type}] with `symbol`
+    in the app's NIFTY{YYMMDD}{STRIKE}{CE|PE} convention.
+
+    Cached to logs/nifty_option_tokens.json keyed by expiry+specs so a
+    same-day restart skips the ~40MB master download.
+    """
+    if not spot:
+        logger.warning("resolve_option_tokens: no spot price; skipping option legs")
+        return []
+    atm = int(round(spot / strike_step) * strike_step)
+    want_strikes = [atm + i * strike_step for i in range(-n_strikes, n_strikes + 1)]
+    key = f"{expiry_iso}:{atm}:{n_strikes}"
+
+    try:
+        cached = json.loads(_OPT_TOKEN_CACHE.read_text())
+        if cached.get("key") == key and cached.get("legs"):
+            logger.info(f"Using cached option tokens ({len(cached['legs'])} legs) for {key}")
+            return cached["legs"]
+    except Exception:
+        pass
+
+    exp_dt = datetime.strptime(expiry_iso, "%Y-%m-%d").date()
+    ang_exp = exp_dt.strftime("%d%b%Y").upper()          # 08SEP2026
+    yymmdd = exp_dt.strftime("%y%m%d")                    # 260908
+
+    logger.info(f"Downloading Angel master for {underlying} options {ang_exp} strikes {want_strikes}...")
+    df = pd.DataFrame(requests.get(SCRIP_MASTER_URL, timeout=90).json())
+    opt = df[(df["exch_seg"] == "NFO") & (df["name"] == underlying)
+             & (df["instrumenttype"] == "OPTIDX")
+             & (df["expiry"].str.upper() == ang_exp)].copy()
+    if opt.empty:
+        logger.warning(f"No OPTIDX rows for {underlying} {ang_exp}; skipping option legs")
+        return []
+    opt["strike_rup"] = (pd.to_numeric(opt["strike"], errors="coerce") / 100).round().astype("Int64")
+
+    legs: list[dict] = []
+    for strike in want_strikes:
+        for typ in ("CE", "PE"):
+            m = opt[(opt["strike_rup"] == strike) & (opt["symbol"].str.endswith(typ))]
+            if m.empty:
+                continue
+            legs.append({
+                "token": str(m.iloc[0]["token"]),
+                "symbol": f"{underlying}{yymmdd}{strike}{typ}",
+                "strike": strike,
+                "type": typ,
+            })
+    if legs:
+        try:
+            _OPT_TOKEN_CACHE.write_text(json.dumps({"key": key, "legs": legs}))
+        except Exception:
+            pass
+    logger.info(f"Resolved {len(legs)} option legs: {[l['symbol'] for l in legs]}")
+    return legs
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
@@ -270,9 +355,11 @@ def normalize_tick(raw: dict) -> dict | None:
     bid = float(buy[0]["price"]) / PRICE_SCALE if buy and buy[0].get("price") else price
     ask = float(sell[0]["price"]) / PRICE_SCALE if sell and sell[0].get("price") else price
 
+    symbol = TOKEN_SYMBOL.get(str(raw.get("token")), SCAN_SYMBOL)
+
     if not _first_tick_logged:
         logger.info(
-            f"FIRST TICK  raw last_traded_price={ltp}  ->  scaled Rs {price:.2f}  "
+            f"FIRST TICK  {symbol}  raw last_traded_price={ltp}  ->  scaled Rs {price:.2f}  "
             f"(scale={PRICE_SCALE}; if this price looks wrong by a power of 10, "
             f"set ANGEL_PRICE_SCALE in .env)"
         )
@@ -280,7 +367,7 @@ def normalize_tick(raw: dict) -> dict | None:
 
     return {
         "timestamp": _to_dt(raw.get("exchange_timestamp")),
-        "symbol": SCAN_SYMBOL,
+        "symbol": symbol,
         "price": price,
         "volume": int(raw.get("volume_trade_for_the_day", 0) or 0),
         "bid_price": bid,
@@ -394,7 +481,12 @@ def main():
     parser.add_argument("--future-token", default="", metavar="TOKEN",
                         help="Skip the instrument-master download; use this NFO "
                              "FUTIDX token directly (also env ANGEL_FUTURE_TOKEN)")
+    parser.add_argument("--no-options", action="store_true",
+                        help="Don't also subscribe to ATM option contracts "
+                             "(default: subscribe ATM +/- ANGEL_OPTION_STRIKES)")
     args = parser.parse_args()
+
+    n_opt_strikes = int(os.getenv("ANGEL_OPTION_STRIKES", "2"))
 
     logger.info("=" * 64)
     logger.info(f"  ANGEL ONE NIFTY TICK COLLECTOR - {PRIMARY_UNDERLYING} ({SCAN_SYMBOL})")
@@ -414,6 +506,26 @@ def main():
     fut = resolve_future_token(PRIMARY_UNDERLYING, args.future_token)
     tokens, adapter = angel_login()
 
+    # token -> symbol map used by normalize_tick for every subscribed leg
+    TOKEN_SYMBOL[str(fut["token"])] = SCAN_SYMBOL
+    all_tokens = [str(fut["token"])]
+
+    if not args.no_options:
+        try:
+            from backtest.option_resolver import get_nearest_expiry
+            exp = get_nearest_expiry(date.today())
+            spot = _ref_price(adapter, fut["token"]) or 0.0
+            if exp and spot:
+                legs = resolve_option_tokens(PRIMARY_UNDERLYING, exp.isoformat(),
+                                             spot, n_strikes=n_opt_strikes)
+                for leg in legs:
+                    TOKEN_SYMBOL[str(leg["token"])] = leg["symbol"]
+                    all_tokens.append(str(leg["token"]))
+            else:
+                logger.warning(f"option legs skipped (expiry={exp}, spot={spot})")
+        except Exception as e:
+            logger.error(f"option-leg setup failed (continuing with future only): {e}")
+
     if args.backfill_days > 0 or args.backfill_only:
         days = args.backfill_days or 5
         try:
@@ -431,10 +543,11 @@ def main():
         max_retry_attempt=50, retry_strategy=1, retry_delay=5,
     )
 
-    token_list = [{"exchangeType": NFO_EXCHANGE_TYPE, "tokens": [fut["token"]]}]
+    token_list = [{"exchangeType": NFO_EXCHANGE_TYPE, "tokens": all_tokens}]
 
     def _on_open(_wsapp):
-        logger.info(f"SmartWebSocket open; subscribing to {fut['symbol']} ({fut['token']}) on NFO...")
+        logger.info(f"SmartWebSocket open; subscribing to {len(all_tokens)} tokens on NFO "
+                    f"({', '.join(sorted(TOKEN_SYMBOL.values()))})...")
         sws.subscribe("nifty_feed", SNAP_QUOTE_MODE, token_list)
 
     def _on_data(_wsapp, message):

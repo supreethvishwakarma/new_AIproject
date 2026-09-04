@@ -8,6 +8,7 @@ Used by the backtest engine to trade actual option premiums instead of delta app
 import re
 import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Optional, Tuple
 
 import pandas as pd
@@ -26,6 +27,65 @@ _OPTION_PREMIUM_CACHE = {}
 _LIVE_EXPIRIES: list[date] | None = None
 _LIVE_EXPIRIES_FETCHED_AT: float = 0.0
 _LIVE_EXPIRIES_TTL = 3600.0  # 1 hour
+
+# Angel One instrument-master expiry list (~40MB download; cached 6h in memory
+# and persisted to logs/nifty_expiries.json so restarts don't re-download)
+_ANGEL_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+_ANGEL_EXPIRIES: list[date] | None = None
+_ANGEL_EXPIRIES_FETCHED_AT: float = 0.0
+_ANGEL_EXPIRIES_TTL = 6 * 3600.0
+_ANGEL_EXPIRY_CACHE_FILE = Path(__file__).resolve().parent.parent / "logs" / "nifty_expiries.json"
+
+
+def _fetch_live_expiries_from_angel() -> list[date]:
+    """
+    Upcoming NIFTY expiries from Angel One's public instrument master
+    (`OPTIDX` rows for NIFTY on NFO). Works with just an Angel account —
+    no market-data subscription — so it's the primary source here.
+
+    Cached 6h in memory + on disk. Returns [] on failure.
+    """
+    global _ANGEL_EXPIRIES, _ANGEL_EXPIRIES_FETCHED_AT
+    now = time.time()
+    if _ANGEL_EXPIRIES is not None and (now - _ANGEL_EXPIRIES_FETCHED_AT) < _ANGEL_EXPIRIES_TTL:
+        return _ANGEL_EXPIRIES
+
+    import json
+    # disk cache first
+    try:
+        if _ANGEL_EXPIRY_CACHE_FILE.exists() and (now - _ANGEL_EXPIRY_CACHE_FILE.stat().st_mtime) < _ANGEL_EXPIRIES_TTL:
+            out = sorted({datetime.strptime(s, "%Y-%m-%d").date() for s in json.loads(_ANGEL_EXPIRY_CACHE_FILE.read_text())})
+            if out:
+                _ANGEL_EXPIRIES, _ANGEL_EXPIRIES_FETCHED_AT = out, now
+                return out
+    except Exception:
+        pass
+
+    try:
+        import requests
+        r = requests.get(_ANGEL_MASTER_URL, timeout=60)
+        r.raise_for_status()
+        out = set()
+        for row in r.json():
+            if (row.get("exch_seg") == "NFO" and row.get("name") == "NIFTY"
+                    and row.get("instrumenttype") == "OPTIDX"):
+                try:
+                    out.add(datetime.strptime(row["expiry"], "%d%b%Y").date())
+                except (ValueError, KeyError):
+                    pass
+        out = sorted(out)
+        if out:
+            _ANGEL_EXPIRIES, _ANGEL_EXPIRIES_FETCHED_AT = out, now
+            try:
+                _ANGEL_EXPIRY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                _ANGEL_EXPIRY_CACHE_FILE.write_text(json.dumps([d.isoformat() for d in out]))
+            except Exception:
+                pass
+            logger.info(f"Fetched {len(out)} NIFTY expiries from Angel master: next 5 = {out[:5]}")
+        return out
+    except Exception as e:
+        logger.warning(f"Angel expiry fetch failed: {e}")
+        return _ANGEL_EXPIRIES or []
 
 
 def _load_expiry_dates(force_reload: bool = False):
@@ -140,16 +200,18 @@ def get_nearest_expiry(ref_date: date) -> Optional[date]:
         return None
 
     # ── Live lookup (today / future) ──────────────────────────────────
-    live = _fetch_live_expiries_from_truedata()
-    for e in live:
-        if e >= ref_date:
-            return e
-
-    # TrueData unreachable — fall back to DB (best effort), but still
-    # filter out expired dates so we never subscribe to a dead contract.
-    for e in _load_expiry_dates():
-        if e >= ref_date:
-            return e
+    # Angel One's instrument master first (works with just a broker login),
+    # then TrueData REST, then whatever the DB has — always filtering out
+    # dates already in the past so we never pick a dead contract.
+    for source in (_fetch_live_expiries_from_angel,
+                   _fetch_live_expiries_from_truedata,
+                   _load_expiry_dates):
+        try:
+            for e in source():
+                if e >= ref_date:
+                    return e
+        except Exception as e:
+            logger.warning(f"expiry source {source.__name__} failed: {e}")
 
     logger.error(f"No live or DB expiry found for ref_date={ref_date}")
     return None
