@@ -1,4 +1,9 @@
-export const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5050";
+// Empty default = same-origin: calls go to /api/* on whatever host served the
+// page, and next.config.ts rewrites proxy them to the Flask backend. This is
+// what makes the dashboard reachable from another device (phone) without also
+// exposing / firewall-opening the backend port. Set NEXT_PUBLIC_API_URL only
+// to point at a backend on a different host.
+export const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
 
 export const SSE_STREAM_URL = `${API_BASE}/api/stream`;
 
